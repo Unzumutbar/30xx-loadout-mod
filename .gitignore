@@ -1,0 +1,6 @@
+/target
+/dist
+*.dll
+*.pdb
+loadout30xx.json
+loadout30xx.log

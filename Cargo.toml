@@ -1,0 +1,30 @@
+[package]
+name = "loadout30xx"
+version = "0.1.0"
+edition = "2021"
+description = "30XX mod: choose the upgrades each player starts a run with (local + online coop)."
+license = "MIT"
+repository = "https://github.com/Unzumutbar/30xx-loadout-mod"
+
+[lib]
+# Built as dinput8.dll so the game loads it from its own folder (proxy DLL).
+name = "dinput8"
+crate-type = ["cdylib"]
+
+[dependencies]
+hudhook = { version = "0.9.3", default-features = false, features = ["dx9", "dx11"] }
+png = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_SystemInformation",
+    "Win32_System_SystemServices",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
