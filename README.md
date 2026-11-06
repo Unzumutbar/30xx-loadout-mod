@@ -9,7 +9,8 @@ supported but not fully tested yet.
 > It contains no game assets: icons and text are read from your own install at runtime.
 
 ## Install
-1. Get `dinput8.dll` (build it, see below).
+1. Download `dinput8.dll` from the [latest release](https://github.com/Unzumutbar/30xx-loadout-mod/releases/latest)
+   (or build it yourself, see below).
 2. Copy it into the game folder next to `30XX.exe`
    (Steam → 30XX → Manage → Browse local files).
 3. Start the game. "30XX Loadout mod loaded - press F8" appears top-left for a few seconds.
