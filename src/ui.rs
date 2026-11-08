@@ -21,6 +21,9 @@ pub struct Menu {
     f8_down: bool,
     filter: [String; 2],
     shown_hint_frames: u32,
+    /// Inventory editor: which local player, and the "Add items" search text.
+    inv_slot: usize,
+    inv_filter: String,
     textures: HashMap<&'static str, TextureId>,
     /// Icon paths not uploaded yet (filled on first frame).
     pending: Option<Vec<&'static str>>,
@@ -125,6 +128,127 @@ impl Menu {
                 ui.text_wrapped(&items::text(it).lore);
             }
         });
+    }
+
+    /// Icon + name for any item id (catalogue items get icon and tooltip).
+    fn item_label(&self, ui: &Ui, id: i32, size: f32) {
+        match items::by_id(id) {
+            Some(it) => {
+                self.icon(ui, it, size);
+                let mut hovered = ui.is_item_hovered();
+                ui.same_line();
+                ui.text(items::name(it));
+                hovered |= ui.is_item_hovered();
+                if hovered {
+                    self.tooltip(ui, it);
+                }
+            }
+            None => {
+                ui.dummy([size, size]);
+                ui.same_line();
+                ui.text(items::name_of(id));
+            }
+        }
+    }
+
+    fn inventory_tab(&mut self, ui: &Ui) {
+        let s = ui.io().font_global_scale;
+        let row_icon = 26.0 * s;
+
+        let present: Vec<bool> = (0..2).map(|i| unsafe { crate::local_player(i).is_some() }).collect();
+        if !present[self.inv_slot] {
+            self.inv_slot = if present[0] { 0 } else { 1 };
+        }
+        for slot in 0..2 {
+            if present[slot] {
+                if slot > 0 {
+                    ui.same_line();
+                }
+                ui.radio_button(format!("Player {}", slot + 1), &mut self.inv_slot, slot);
+            }
+        }
+        let Some(player) = (unsafe { crate::local_player(self.inv_slot) }) else {
+            ui.text_disabled("No local player loaded yet - start or continue a run.");
+            return;
+        };
+        let inv = unsafe { crate::game::inventory(player) };
+        let slot = self.inv_slot;
+        let mut edits: Vec<crate::Edit> = Vec::new();
+        ui.text_disabled("Changes apply immediately using the game's own add/remove code.");
+
+        ui.child_window("inv").size([0.0, 0.0]).border(true).build(|| {
+            // --- Augs / Boons / Hexes: stackable ------------------------------------
+            if ui.collapsing_header(format!("Augs, Boons & Hexes ({})", inv.augs.len()), TreeNodeFlags::DEFAULT_OPEN) {
+                if inv.augs.is_empty() {
+                    ui.text_disabled("None");
+                }
+                for &(id, count) in &inv.augs {
+                    let _id = ui.push_id_int(id);
+                    if ui.small_button(" - ") {
+                        edits.push(crate::Edit { slot, item: id, delta: -1 });
+                    }
+                    ui.same_line();
+                    ui.text(format!("{count:>2}"));
+                    ui.same_line();
+                    if ui.small_button(" + ") {
+                        edits.push(crate::Edit { slot, item: id, delta: 1 });
+                    }
+                    ui.same_line();
+                    if ui.small_button("Remove") {
+                        edits.push(crate::Edit { slot, item: id, delta: -count });
+                    }
+                    ui.same_line();
+                    self.item_label(ui, id, row_icon);
+                }
+            }
+            // --- Cores / primary weapons ----------------------------------------------
+            if ui.collapsing_header(format!("Cores & Weapons ({})", inv.cores.len()), TreeNodeFlags::DEFAULT_OPEN) {
+                if inv.cores.is_empty() {
+                    ui.text_disabled("None");
+                }
+                for (n, &id) in inv.cores.iter().enumerate() {
+                    let _id = ui.push_id_usize(10_000 + n);
+                    if ui.small_button("Remove") {
+                        edits.push(crate::Edit { slot, item: id, delta: -1 });
+                    }
+                    ui.same_line();
+                    self.item_label(ui, id, row_icon);
+                }
+            }
+            // --- Powers (read-only) -------------------------------------------------------
+            if ui.collapsing_header(format!("Powers ({}) - view only", inv.powers.len()), TreeNodeFlags::empty()) {
+                ui.text_disabled("Powers live in fixed slots; removing them isn't supported yet.");
+                for &id in &inv.powers {
+                    self.item_label(ui, id, row_icon);
+                }
+            }
+            // --- Add any item -------------------------------------------------------------
+            if ui.collapsing_header("Add items", TreeNodeFlags::empty()) {
+                ui.input_text("Find", &mut self.inv_filter).hint("name or description").build();
+                let needle = self.inv_filter.to_lowercase();
+                if needle.len() < 2 {
+                    ui.text_disabled("Type at least 2 letters.");
+                } else {
+                    let hits = ITEMS.iter().filter(|i| {
+                        items::name(i).to_lowercase().contains(&needle) || items::text(i).desc.to_lowercase().contains(&needle)
+                    });
+                    for it in hits.take(40) {
+                        let _id = ui.push_id_int(20_000 + it.id);
+                        if ui.small_button("Add") {
+                            edits.push(crate::Edit { slot, item: it.id, delta: 1 });
+                        }
+                        ui.same_line();
+                        self.item_label(ui, it.id, row_icon);
+                    }
+                }
+            }
+        });
+
+        if !edits.is_empty() {
+            if let Ok(mut st) = state().lock() {
+                st.edits.extend(edits);
+            }
+        }
     }
 
     fn player_tab(&mut self, ui: &Ui, slot: usize) {
@@ -296,6 +420,9 @@ impl ImguiRenderLoop for Menu {
                         if let Some(_t) = ui.tab_item(format!("Player {}", slot + 1)) {
                             self.player_tab(ui, slot);
                         }
+                    }
+                    if let Some(_t) = ui.tab_item("Inventory (live)") {
+                        self.inventory_tab(ui);
                     }
                 }
             });

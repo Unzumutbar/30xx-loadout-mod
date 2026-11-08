@@ -69,10 +69,31 @@ fn texts() -> &'static HashMap<String, Text> {
     })
 }
 
-/// Name/description of an item; falls back to the item key if the game data has none.
+/// Name/description of an item; empty if the game data has none.
 pub fn text(item: &Item) -> &'static Text {
+    text_key(item.key)
+}
+
+/// Text by item key (works for any item, not just the catalogue).
+pub fn text_key(key: &str) -> &'static Text {
     static EMPTY: OnceLock<Text> = OnceLock::new();
-    texts().get(item.key).unwrap_or_else(|| EMPTY.get_or_init(Text::default))
+    texts().get(key).unwrap_or_else(|| EMPTY.get_or_init(Text::default))
+}
+
+/// Catalogue entry for an item id, if it is one.
+pub fn by_id(id: i32) -> Option<&'static Item> {
+    ITEMS.iter().find(|i| i.id == id)
+}
+
+/// Best display name for any item id: game text, else the item key, else "#id".
+pub fn name_of(id: i32) -> String {
+    match crate::keys::key_of(id) {
+        Some(k) => {
+            let t = text_key(k);
+            if t.name.is_empty() || t.name == "~" { k.to_string() } else { t.name.clone() }
+        }
+        None => format!("#{id}"),
+    }
 }
 
 pub fn name(item: &Item) -> &'static str {

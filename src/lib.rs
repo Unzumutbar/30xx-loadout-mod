@@ -5,11 +5,15 @@
 //! system DLL and, on a background thread, install:
 //!   * a hook on the game's run-start "apply Codebreakers" routine that gives each
 //!     local player the items chosen in the menu, and
-//!   * a Dear ImGui overlay (DX11 / DX9) for picking those items (toggle with F8).
+//!   * a hook on the game's network message handler, so inventory removals made in the
+//!     editor are mirrored on the online coop partner's machine, and
+//!   * a Dear ImGui overlay (DX11 / DX9) for picking those items and editing the live
+//!     inventory (toggle with F8).
 
 mod config;
 mod game;
 mod items;
+mod keys;
 mod ui;
 
 use std::ffi::c_void;
@@ -41,6 +45,15 @@ pub struct State {
     pub give_now: bool,
     /// Log of what was applied, newest last (shown in the menu).
     pub history: Vec<String>,
+    /// Inventory edits requested by the menu; applied on the render (game) thread.
+    pub edits: Vec<Edit>,
+}
+
+/// Add (`delta > 0`) or remove (`delta < 0`) copies of an item for a local player slot.
+pub struct Edit {
+    pub slot: usize,
+    pub item: i32,
+    pub delta: i32,
 }
 
 pub fn state() -> &'static Mutex<State> {
@@ -52,6 +65,7 @@ pub fn state() -> &'static Mutex<State> {
             hooks_ok: false,
             give_now: false,
             history: Vec::new(),
+            edits: Vec::new(),
         })
     })
 }
@@ -129,19 +143,98 @@ unsafe extern "system" fn apply_codebreakers_detour(player: *mut c_void) {
     let orig: ApplyCbFn = std::mem::transmute(ORIG_APPLY_CB.load(Ordering::Relaxed));
     orig(player);
     log!(
-        "run start: player netId={} localSlot={:?} role={} mode={}",
+        "run start: player netId={} localSlot={:?} role={} mode={} thread={:?}",
         game::net_id(player),
         game::local_slot(player),
         game::net_role(),
-        game::game_mode()
+        game::game_mode(),
+        std::thread::current().id()
     );
     if let Some(m) = apply_loadout(player, "Run start") {
         push_history(m);
     }
 }
 
+// ---------------------------------------------------------------------------------
+// Network hook (mirrors inventory removals to the online partner)
+// ---------------------------------------------------------------------------------
+
+type NetDispatchFn = unsafe extern "system" fn(conn: *mut c_void);
+static ORIG_NET_DISPATCH: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn net_dispatch_detour(conn: *mut c_void) {
+    game::handle_incoming(conn);
+    let orig: NetDispatchFn = std::mem::transmute(ORIG_NET_DISPATCH.load(Ordering::Relaxed));
+    orig(conn);
+}
+
+// ---------------------------------------------------------------------------------
+// Live inventory edits
+// ---------------------------------------------------------------------------------
+
+/// The Player object for a local slot (0 = Player 1, 1 = Player 2), if one exists.
+pub unsafe fn local_player(slot: usize) -> Option<*mut c_void> {
+    game::players().into_iter().find(|&p| game::local_slot(p) == Some(slot))
+}
+
+unsafe fn apply_edit(e: &Edit) {
+    let Some(p) = local_player(e.slot) else { return };
+    let name = keys::key_of(e.item).unwrap_or("?");
+    if e.delta > 0 {
+        let items = vec![e.item; e.delta as usize];
+        for &it in &items {
+            game::give_item(p, it);
+        }
+        if game::net_role() != 0 {
+            game::broadcast_items(p, &items);
+        }
+        log!("edit: +{} {name} ({}) for Player {}", e.delta, e.item, e.slot + 1);
+    } else if e.delta < 0 {
+        let n = -e.delta;
+        for _ in 0..n {
+            game::remove_item(p, e.item);
+        }
+        if game::net_role() != 0 {
+            game::broadcast_remove(p, e.item, n);
+        }
+        log!("edit: -{n} {name} ({}) for Player {}", e.item, e.slot + 1);
+    }
+}
+
 /// Called every frame from the overlay (which runs on the game's render thread).
 pub fn on_frame() {
+    static LOGGED_THREAD: AtomicBool = AtomicBool::new(false);
+    if !LOGGED_THREAD.swap(true, Ordering::Relaxed) {
+        log!("render thread={:?}", std::thread::current().id());
+    }
+
+    // Debug aid: LOADOUT30XX_DEBUG=1 logs every local player's inventory every ~10 s.
+    static FRAME: AtomicUsize = AtomicUsize::new(0);
+    static DEBUG: OnceLock<bool> = OnceLock::new();
+    if *DEBUG.get_or_init(|| std::env::var_os("LOADOUT30XX_DEBUG").is_some())
+        && FRAME.fetch_add(1, Ordering::Relaxed) % 600 == 0
+    {
+        unsafe {
+            for slot in 0..2 {
+                if let Some(p) = local_player(slot) {
+                    let inv = game::inventory(p);
+                    log!(
+                        "debug inv P{}: augs={:?} cores={:?} powers={:?}",
+                        slot + 1,
+                        inv.augs.iter().map(|&(i, c)| format!("{}x{c}", items::name_of(i))).collect::<Vec<_>>(),
+                        inv.cores.iter().map(|&i| items::name_of(i)).collect::<Vec<_>>(),
+                        inv.powers.iter().map(|&i| items::name_of(i)).collect::<Vec<_>>()
+                    );
+                }
+            }
+        }
+    }
+
+    let edits = state().lock().map(|mut s| std::mem::take(&mut s.edits)).unwrap_or_default();
+    for e in &edits {
+        unsafe { apply_edit(e) };
+    }
+
     let want = state().lock().map(|mut s| std::mem::take(&mut s.give_now)).unwrap_or(false);
     if !want {
         return;
@@ -219,6 +312,22 @@ fn init() {
                 }
             }
             Err(e) => set_status(false, format!("Disabled: could not create run-start hook ({e:?})")),
+        }
+
+        // Optional: without this hook everything works locally; only online mirroring
+        // of removals is lost.
+        let target = (game::base() + game::RVA_NET_DISPATCH) as *mut c_void;
+        match MhHook::new(target, net_dispatch_detour as *mut c_void) {
+            Ok(h) => {
+                ORIG_NET_DISPATCH.store(h.trampoline() as usize, Ordering::Relaxed);
+                if MH_EnableHook(target) == hudhook::mh::MH_STATUS::MH_OK {
+                    log!("network hook installed");
+                    std::mem::forget(h);
+                } else {
+                    log!("network hook could not be enabled (online removal sync off)");
+                }
+            }
+            Err(e) => log!("network hook failed ({e:?}); online removal sync off"),
         }
     }
 }

@@ -17,6 +17,12 @@ use crate::log;
 pub const RVA_APPLY_CODEBREAKERS: usize = 0x4d33a0;
 /// `void GiveItem(Player*, int itemId, bool silent)`.
 pub const RVA_GIVE_ITEM: usize = 0x4b1440;
+/// `void RemoveItem(Player*, int itemId, bool forgetHistory, bool onlyFlagged)` - the
+/// inverse of GiveItem: decrements an Aug stack and undoes its effect; Cores and
+/// primary weapons are routed to the game's core-removal code.
+const RVA_REMOVE_ITEM: usize = 0x4b82e0;
+/// `void HandleNetMessages(Connection*)` - processes every received message string.
+pub const RVA_NET_DISPATCH: usize = 0x54c8b0;
 /// `std::string& std::string::assign(std::string*, const char*, size_t)`.
 const RVA_STRING_ASSIGN: usize = 0xf9f0;
 /// `std::string::~string` (tidy).
@@ -41,6 +47,10 @@ const SIGNATURES: &[(usize, &[u8])] = &[
     (RVA_STRING_ASSIGN, &[0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x6c, 0x24, 0x18, 0x56, 0x57, 0x41, 0x57]),
     (RVA_STRING_DTOR, &[0x40, 0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x8b, 0x51, 0x18]),
     (RVA_VEC_EMPLACE_REALLOC, &[0x48, 0x89, 0x5c, 0x24, 0x18, 0x56, 0x57, 0x41, 0x56]),
+    (RVA_REMOVE_ITEM, &[0x48, 0x89, 0x5c, 0x24, 0x18, 0x55, 0x56, 0x57, 0x41, 0x56, 0x41, 0x57, 0x48, 0x8d, 0x6c, 0x24]),
+    (RVA_NET_DISPATCH, &[0x48, 0x89, 0x5c, 0x24, 0x10, 0x48, 0x89, 0x74, 0x24, 0x18, 0x48, 0x89, 0x7c, 0x24, 0x20, 0x55]),
+    // "riscrap" command name: confirms the dispatcher/message layout is unchanged.
+    (0x8bb9b8, b"riscrap\0"),
     // "protoga %d %d %d" format string and the "volunteer" item key: data layout check.
     (0x8b96f0, b"protoga %d %d %d"),
     (0x8b07b0, b"volunteer\0"),
@@ -167,6 +177,118 @@ unsafe fn queue_net_message(msg: &str) {
         realloc(vec, end, &mut s);
     }
     dtor(&mut s);
+}
+
+// ---------------------------------------------------------------------------------
+// Inventory
+// ---------------------------------------------------------------------------------
+
+/// Player fields (all `std::vector`s are {begin, end, capacity}).
+const INV_AUGS: usize = 0x2178; // vector<{i32 id, i32 count, u8 flag}>, 12-byte entries
+const INV_CORES: usize = 0x2110; // vector<0x68-byte slot>, id at +0 (Cores + primary weapons)
+const INV_POWERS: usize = 0x2190; // [0x68-byte slot; 12], id at +0, 0 = empty
+
+pub struct Inventory {
+    /// Augs, Boons and Hexes: (id, stack count).
+    pub augs: Vec<(i32, i32)>,
+    /// Cores and primary weapons.
+    pub cores: Vec<i32>,
+    /// Powers (read-only in the editor).
+    pub powers: Vec<i32>,
+}
+
+unsafe fn vec_range(player: *mut c_void, off: usize, stride: usize) -> Option<(usize, usize)> {
+    let b = *((player as usize + off) as *const usize);
+    let e = *((player as usize + off + 8) as *const usize);
+    if b == 0 || e < b || (e - b) % stride != 0 || (e - b) / stride > 512 {
+        return None;
+    }
+    Some((b, (e - b) / stride))
+}
+
+pub unsafe fn inventory(player: *mut c_void) -> Inventory {
+    let mut inv = Inventory { augs: Vec::new(), cores: Vec::new(), powers: Vec::new() };
+    if let Some((b, n)) = vec_range(player, INV_AUGS, 12) {
+        for i in 0..n {
+            let e = b + i * 12;
+            let id = *(e as *const i32);
+            let count = *((e + 4) as *const i32);
+            if id > 0 && count > 0 {
+                inv.augs.push((id, count));
+            }
+        }
+    }
+    if let Some((b, n)) = vec_range(player, INV_CORES, 0x68) {
+        for i in 0..n {
+            let id = *((b + i * 0x68) as *const i32);
+            if id > 0 {
+                inv.cores.push(id);
+            }
+        }
+    }
+    for i in 0..12 {
+        let id = *((player as usize + INV_POWERS + i * 0x68) as *const i32);
+        if id > 0 {
+            inv.powers.push(id);
+        }
+    }
+    inv
+}
+
+type RemoveItemFn = unsafe extern "system" fn(player: *mut c_void, item: i32, forget: u8, only_flagged: u8);
+
+/// Remove one copy of `item` from `player`, undoing its effect (the game's own routine).
+pub unsafe fn remove_item(player: *mut c_void, item: i32) {
+    let f: RemoveItemFn = std::mem::transmute(at(RVA_REMOVE_ITEM));
+    f(player, item, 1, 0);
+}
+
+/// Our own network command: "l30rm <playerId> <itemId> <count>". The game ignores
+/// commands it doesn't know, so partners without the mod are unaffected.
+const NET_REMOVE: &str = "l30rm";
+
+/// Tell the other machine(s) that `count` copies of `item` were removed from `player`.
+pub unsafe fn broadcast_remove(player: *mut c_void, item: i32, count: i32) {
+    let msg = format!("{NET_REMOVE} {} {item} {count}", net_id(player));
+    log!("net: {msg}");
+    queue_net_message(&msg);
+}
+
+/// Called (from the dispatcher hook) before the game processes a batch of received
+/// messages: apply any of our removal commands. The messages stay in the list; the
+/// game skips them as unknown commands.
+pub unsafe fn handle_incoming(conn: *mut c_void) {
+    let b = *((conn as usize + 0x18) as *const usize);
+    let e = *((conn as usize + 0x20) as *const usize);
+    if b == 0 || e < b || (e - b) % 32 != 0 || (e - b) / 32 > 4096 {
+        return;
+    }
+    for i in 0..(e - b) / 32 {
+        let s = &*((b + i * 32) as *const MsvcString);
+        if s.size < NET_REMOVE.len() || s.size > 256 {
+            continue;
+        }
+        let data = if s.cap >= 16 { *(s.buf.as_ptr() as *const *const u8) } else { s.buf.as_ptr() };
+        let bytes = std::slice::from_raw_parts(data, s.size);
+        let Ok(text) = std::str::from_utf8(bytes) else { continue };
+        let mut parts = text.split_whitespace();
+        if parts.next() != Some(NET_REMOVE) {
+            continue;
+        }
+        let nums: Vec<i32> = parts.filter_map(|p| p.parse().ok()).collect();
+        let [pid, item, count] = nums[..] else { continue };
+        if !(1..0x7ff).contains(&item) || !(1..=99).contains(&count) {
+            continue;
+        }
+        let Some(p) = players().into_iter().find(|&p| net_id(p) == pid) else { continue };
+        if local_slot(p).is_some() {
+            continue; // never let a remote command edit our own players
+        }
+        for _ in 0..count {
+            remove_item(p, item);
+        }
+        log!("net recv: removed {count}x item {item} from player {pid}");
+    }
 }
 
 /// Tell the other machine(s) in an online session that `player` received `items`.

@@ -28,6 +28,17 @@ supported but not fully tested yet.
   run. Pressing it twice gives everything twice.
 * Untick **Enabled** to play vanilla without uninstalling.
 
+### Inventory editor (live)
+The **Inventory (live)** tab shows the current inventory of each local player during a run:
+* **Augs, Boons & Hexes:** `-` / `+` change the stack count, **Remove** drops the whole stack.
+* **Cores & Weapons:** **Remove** takes the item away.
+* **Powers:** shown read-only (removing Powers isn't supported yet).
+* **Add items:** search any item and add it directly.
+
+Adding and removing use the game's own routines (`GiveItem` / `RemoveItem`), so item
+effects are applied and undone the same way the game does it. In online coop the
+change is mirrored on your partner's machine (they need v0.2 or newer).
+
 ## Coop
 * **Local coop:** Player 1 and Player 2 have separate lists.
 * **Online coop:** both players install the mod. Each player sets up the **Player 1**
@@ -45,6 +56,9 @@ forwards that call to the real system DLL, and on a background thread it:
   and calls the game's own `GiveItem` for each selected item;
 * for online play, queues `protoga <playerId> <count> <items…>` network messages,
   the format the game already uses to sync randomly rolled starting items;
+* mirrors inventory removals online with its own `l30rm <playerId> <item> <count>`
+  message, picked up by a hook on the game's network handler (the game itself
+  skips commands it doesn't know, so players without the mod are unaffected);
 * draws a Dear ImGui overlay through [hudhook](https://github.com/veeenu/hudhook)
   (DirectX 11 and 9).
 
